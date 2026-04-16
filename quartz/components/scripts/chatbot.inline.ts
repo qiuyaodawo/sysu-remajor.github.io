@@ -24,6 +24,29 @@ type SourceType =
   | "general"
 type ReviewConfidence = "high" | "medium" | "low"
 type EvidenceFacet = "eligibility" | "exam" | "process" | "timeline" | "quota" | "grade" | "general"
+type MetadataPrimitive = string | number | boolean
+
+interface RawChatbotDocumentMetadata {
+  sourceType?: MetadataPrimitive
+  policyYear?: MetadataPrimitive | MetadataPrimitive[]
+  academy?: MetadataPrimitive
+  authority?: MetadataPrimitive
+  isOfficial?: MetadataPrimitive
+  faculty?: MetadataPrimitive
+  campus?: MetadataPrimitive
+}
+
+interface ChatbotDocumentMetadata {
+  sourceType?: SourceType
+  policyYear?: string[]
+  academy?: string
+  authority?: string
+  isOfficial?: boolean
+  faculty?: string
+  campus?: string
+}
+
+type ContentDocument = ContentDetails & { metadata?: RawChatbotDocumentMetadata }
 
 interface SessionProfile {
   academies: string[]
@@ -59,6 +82,7 @@ interface StoredMessage {
 interface StoredSession {
   profile: SessionProfile
   history: StoredMessage[]
+  rollingSummary?: string
 }
 
 interface PlannerResult {
@@ -74,6 +98,16 @@ interface PlannerResult {
   preferredSourceTypes: SourceType[]
 }
 
+interface ContextualizedPlan extends PlannerResult {
+  standaloneQuestion: string
+  rollingSummary: string
+}
+
+interface EffectiveTurn {
+  questionForModel: string
+  isSupplement: boolean
+}
+
 interface KnowledgeChunk {
   id: string
   slug: FullSlug
@@ -82,9 +116,12 @@ interface KnowledgeChunk {
   preview: string
   sourceType: SourceType
   academy: string
+  authority: string
+  isOfficial: boolean
   years: string[]
   maxYear: number
   tags: string[]
+  metadata: ChatbotDocumentMetadata
   titleTokens: Set<string>
   contentTokens: Set<string>
   normalizedTitle: string
@@ -203,6 +240,46 @@ const MANUAL_ALIAS_OVERRIDES: Record<string, string[]> = {
   管理学院: ["管院", "管理"],
   外国语学院: ["外院", "外国语"],
 }
+const SOURCE_LABELS_ZH: Record<SourceType, string> = {
+  official_policy: "官方政策",
+  academy_summary: "学院页面",
+  editorial_summary: "站内整理",
+  secondary_selection: "二次遴选",
+  exam_recall: "历年真题/回忆",
+  community: "经验社区",
+  general: "其他资料",
+}
+const TOPIC_HINTS_ZH = [
+  "转专业",
+  "转入",
+  "转出",
+  "资格",
+  "要求",
+  "条件",
+  "流程",
+  "时间",
+  "名额",
+  "GPA",
+  "绩点",
+  "排名",
+  "材料",
+  "面试",
+  "笔试",
+  "考核",
+  "备考",
+  "真题",
+  "保研",
+  "二次遴选",
+]
+const MANUAL_ALIAS_OVERRIDES_ZH: Record<string, string[]> = {
+  计算机学院: ["计算机", "计院", "转计", "计科"],
+  数学学院: ["数学", "数院"],
+  物理学院: ["物理", "物院"],
+  化学学院: ["化学", "化院"],
+  生命科学学院: ["生科", "生命科学"],
+  管理学院: ["管院", "管理"],
+  外国语学院: ["外院", "外国语"],
+}
 const EMPTY_PROFILE: SessionProfile = {
   academies: [],
   years: [],
@@ -213,7 +290,8 @@ const EMPTY_PROFILE: SessionProfile = {
 const STOP_ICON =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>'
 
-const chatbotState = window as Window & { __sysuRemajorChatbotState?: ChatbotState }
+const chatbotState = globalThis as typeof globalThis &
+  Window & { __sysuRemajorChatbotState?: ChatbotState }
 
 function normalizeText(input: string): string {
   return input
@@ -243,6 +321,10 @@ function unique<T>(items: T[]): T[] {
   return [...new Set(items)]
 }
 
+function sourceLabel(sourceType: SourceType): string {
+  return SOURCE_LABELS_ZH[sourceType] ?? SOURCE_LABELS[sourceType] ?? sourceType
+}
+
 function mergeLimited(current: string[], incoming: string[], limit: number): string[] {
   return unique([...incoming, ...current]).filter(Boolean).slice(0, limit)
 }
@@ -251,12 +333,157 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max)
 }
 
+function recentConversationSummary(history: StoredMessage[], limit = 4): string {
+  return history
+    .slice(-limit)
+    .map((message) => `${message.role === "user" ? "用户" : "助手"}: ${stripMarkupNoise(message.content)}`)
+    .join("\n")
+}
+
+function looksLikeClarificationRequest(text: string): boolean {
+  const normalized = normalizeText(text)
+  return [
+    "请补充",
+    "补充一下",
+    "发我",
+    "告诉我",
+    "课程正式名称",
+    "具体是哪个",
+    "具体是哪一门",
+    "哪一年",
+    "哪个学院",
+    "请说明",
+    "我可以继续帮你判断得更准一点",
+  ].some((pattern) => normalized.includes(normalizeText(pattern)))
+}
+
+function isLikelySupplementInput(text: string): boolean {
+  const trimmed = text.trim()
+  if (!trimmed) return false
+  if (trimmed.length > 32) return false
+  if (/[\n]/.test(trimmed)) return false
+  if (/[?？]/.test(trimmed)) return false
+  if (/^(为什么|怎么|如何|能不能|可不可以|是不是|是什么|多少|几点|几号)/.test(trimmed)) return false
+
+  return (
+    /^(20\d{2}|大一|大二|高等数学[一二三上下]?|数学分析|医科数学|计算机学院|计算机|计院|86分|\d{2,3}分)$/.test(trimmed) ||
+    trimmed.length <= 12
+  )
+}
+
+function mergeSupplementQuestion(previousQuestion: string, supplement: string): string {
+  const normalizedPrevious = previousQuestion.trim()
+  const normalizedSupplement = supplement.trim()
+  const nestedMatch = /^原问题：([\s\S]+?)\n补充信息：([\s\S]+)$/.exec(normalizedPrevious)
+  if (!nestedMatch) {
+    return `原问题：${normalizedPrevious}\n补充信息：${normalizedSupplement}`
+  }
+
+  const originalQuestion = nestedMatch[1].trim()
+  const existingSupplement = nestedMatch[2].trim()
+  const mergedSupplement = existingSupplement.includes(normalizedSupplement)
+    ? existingSupplement
+    : `${existingSupplement}；${normalizedSupplement}`
+
+  return `原问题：${originalQuestion}\n补充信息：${mergedSupplement}`
+}
+
+function buildEffectiveQuestion(
+  currentInput: string,
+  session: StoredSession,
+): EffectiveTurn {
+  const trimmed = currentInput.trim()
+  const previousUser = [...session.history].reverse().find((message) => message.role === "user")
+  const lastAssistant = [...session.history].reverse().find((message) => message.role === "assistant")
+
+  if (
+    previousUser &&
+    lastAssistant &&
+    looksLikeClarificationRequest(lastAssistant.content) &&
+    isLikelySupplementInput(trimmed)
+  ) {
+    return {
+      questionForModel: mergeSupplementQuestion(previousUser.content, trimmed),
+      isSupplement: true,
+    }
+  }
+
+  return {
+    questionForModel: trimmed,
+    isSupplement: false,
+  }
+}
+
+function truncateSummary(text: string, maxLength = 260): string {
+  const cleaned = stripMarkupNoise(text).replace(/\s+/g, " ").trim()
+  if (!cleaned) return ""
+  return cleaned.length <= maxLength ? cleaned : `${cleaned.slice(0, maxLength - 1)}…`
+}
+
+function buildRollingSummary(session: StoredSession): string {
+  const facts = [
+    session.profile.academies.length > 0 ? `关注学院：${session.profile.academies.join("、")}` : "",
+    session.profile.years.length > 0 ? `关注年份：${session.profile.years.join("、")}` : "",
+    session.profile.topics.length > 0 ? `关注问题：${session.profile.topics.slice(0, 5).join("、")}` : "",
+  ].filter(Boolean)
+
+  const recent = session.history.length > 0 ? recentConversationSummary(session.history, 4) : ""
+  return truncateSummary(
+    [
+      session.rollingSummary ? `历史摘要：${session.rollingSummary}` : "",
+      facts.join("；"),
+      recent ? `最近对话：\n${recent}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+  )
+}
+
+function contextualizeFallback(
+  currentInput: string,
+  session: StoredSession,
+  knowledgeBase: KnowledgeBase,
+  preparedTurn?: EffectiveTurn,
+): ContextualizedPlan {
+  const effectiveTurn = preparedTurn ?? buildEffectiveQuestion(currentInput, session)
+  const plan = plannerFallback(effectiveTurn.questionForModel, session, knowledgeBase)
+
+  return {
+    ...plan,
+    standaloneQuestion: effectiveTurn.questionForModel,
+    rollingSummary: buildRollingSummary(session),
+  }
+}
+
+function normalizeContextualizedPlan(
+  raw: unknown,
+  fallback: ContextualizedPlan,
+  knowledgeBase: KnowledgeBase,
+): ContextualizedPlan {
+  const candidate = raw && typeof raw === "object" ? (raw as Partial<ContextualizedPlan>) : {}
+  const normalizedPlan = normalizePlannerResult(candidate, fallback, knowledgeBase)
+  const standaloneQuestion =
+    typeof candidate.standaloneQuestion === "string"
+      ? stripMarkupNoise(candidate.standaloneQuestion)
+      : fallback.standaloneQuestion
+  const rollingSummary =
+    typeof candidate.rollingSummary === "string"
+      ? truncateSummary(candidate.rollingSummary)
+      : fallback.rollingSummary
+
+  return {
+    ...normalizedPlan,
+    standaloneQuestion: standaloneQuestion.length >= 2 ? standaloneQuestion : fallback.standaloneQuestion,
+    rollingSummary: rollingSummary || fallback.rollingSummary,
+  }
+}
+
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError"
 }
 
 function isMixedContentRequest(apiBase: string): boolean {
-  return window.location.protocol === "https:" && /^http:\/\//i.test(apiBase)
+  return chatbotState.location?.protocol === "https:" && /^http:\/\//i.test(apiBase)
 }
 
 function normalizeChatEndpoint(apiBase: string): string {
@@ -318,6 +545,56 @@ function extractYears(...inputs: string[]): string[] {
   return [...years].sort((a, b) => Number(b) - Number(a))
 }
 
+function normalizeMetadataText(value: unknown): string {
+  if (typeof value === "number") return String(value)
+  if (typeof value !== "string") return ""
+  return stripMarkupNoise(value).replace(/\s+/g, " ").trim()
+}
+
+function normalizeMetadataBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value
+  if (typeof value !== "string") return undefined
+
+  const normalized = value.trim().toLowerCase()
+  if (["true", "yes", "y", "1"].includes(normalized)) return true
+  if (["false", "no", "n", "0"].includes(normalized)) return false
+  return undefined
+}
+
+function normalizeMetadataYears(value: unknown): string[] {
+  const rawValues = Array.isArray(value) ? value : [value]
+  return unique(
+    rawValues
+      .flatMap((item) => extractYears(normalizeMetadataText(item)))
+      .filter((year) => /^20\d{2}$/.test(year)),
+  ).sort((a, b) => Number(b) - Number(a))
+}
+
+function normalizeDocumentMetadata(raw: unknown): ChatbotDocumentMetadata {
+  const candidate = raw && typeof raw === "object" ? (raw as RawChatbotDocumentMetadata) : {}
+  const sourceType = isSourceType(candidate.sourceType) ? candidate.sourceType : undefined
+  const policyYear = normalizeMetadataYears(candidate.policyYear)
+  const academy = normalizeMetadataText(candidate.academy)
+  const authority = normalizeMetadataText(candidate.authority)
+  const faculty = normalizeMetadataText(candidate.faculty)
+  const campus = normalizeMetadataText(candidate.campus)
+  const isOfficial = normalizeMetadataBoolean(candidate.isOfficial)
+
+  return {
+    ...(sourceType ? { sourceType } : {}),
+    ...(policyYear.length > 0 ? { policyYear } : {}),
+    ...(academy ? { academy } : {}),
+    ...(authority ? { authority } : {}),
+    ...(typeof isOfficial === "boolean" ? { isOfficial } : {}),
+    ...(faculty ? { faculty } : {}),
+    ...(campus ? { campus } : {}),
+  }
+}
+
+function isSourceType(value: unknown): value is SourceType {
+  return typeof value === "string" && SOURCE_TYPE_VALUES.includes(value as SourceType)
+}
+
 function maxYear(years: string[]): number {
   if (years.length === 0) return 0
   return Math.max(...years.map((year) => Number(year)))
@@ -333,7 +610,7 @@ function collectAliases(name: string): string[] {
   aliases.add(cleaned.replace(/学院|学部|系$/g, "").trim())
   aliases.add(cleaned.replace(/\s+/g, ""))
 
-  const manual = MANUAL_ALIAS_OVERRIDES[cleaned] ?? []
+  const manual = [...(MANUAL_ALIAS_OVERRIDES[cleaned] ?? []), ...(MANUAL_ALIAS_OVERRIDES_ZH[cleaned] ?? [])]
   for (const alias of manual) {
     aliases.add(alias)
   }
@@ -352,6 +629,10 @@ function detectSourceType(slug: FullSlug): SourceType {
   return "general"
 }
 
+function resolveSourceType(slug: FullSlug, metadata: ChatbotDocumentMetadata): SourceType {
+  return metadata.sourceType ?? detectSourceType(slug)
+}
+
 function detectAcademy(slug: FullSlug, title: string): string {
   const slugMatch = /^学院\/([^/]+)/.exec(slug)
   if (slugMatch) {
@@ -361,6 +642,38 @@ function detectAcademy(slug: FullSlug, title: string): string {
   const titleMatches = title.match(/[\u4e00-\u9fffA-Za-z0-9]+(?:学院|学部|系)/g) ?? []
   const firstMatch = titleMatches[0]
   return firstMatch ? normalizeEntityName(firstMatch) : ""
+}
+
+function resolveAcademy(slug: FullSlug, title: string, metadata: ChatbotDocumentMetadata): string {
+  return metadata.academy ? normalizeEntityName(metadata.academy) : detectAcademy(slug, title)
+}
+
+function resolveYears(
+  slug: FullSlug,
+  title: string,
+  tags: string[],
+  content: string,
+  metadata: ChatbotDocumentMetadata,
+): string[] {
+  const metadataYears = metadata.policyYear ?? []
+  if (metadataYears.length > 0) {
+    return metadataYears
+  }
+
+  return extractYears(slug, title, tags.join(" "), content.slice(0, 800))
+}
+
+function resolveAuthority(
+  metadata: ChatbotDocumentMetadata,
+  academy: string,
+  title: string,
+  sourceType: SourceType,
+): string {
+  if (metadata.authority) return metadata.authority
+  if (sourceType === "official_policy") {
+    return academy || title
+  }
+  return ""
 }
 
 function splitLongText(text: string): string[] {
@@ -439,9 +752,12 @@ function buildKnowledgeBase(data: ContentIndex): KnowledgeBase {
 
   for (const [slug, doc] of Object.entries<ContentDetails>(data) as Array<[FullSlug, ContentDetails]>) {
     const title = doc.title ?? slug
-    const sourceType = detectSourceType(slug)
-    const academy = detectAcademy(slug, title)
-    const years = extractYears(slug, title, doc.tags.join(" "), doc.content.slice(0, 800))
+    const metadata = normalizeDocumentMetadata((doc as ContentDocument).metadata)
+    const sourceType = resolveSourceType(slug, metadata)
+    const academy = resolveAcademy(slug, title, metadata)
+    const years = resolveYears(slug, title, doc.tags ?? [], doc.content, metadata)
+    const authority = resolveAuthority(metadata, academy, title, sourceType)
+    const isOfficial = metadata.isOfficial ?? sourceType === "official_policy"
     const allChunks = chunkDocument(doc.content)
 
     if (academy) {
@@ -461,9 +777,12 @@ function buildKnowledgeBase(data: ContentIndex): KnowledgeBase {
         preview,
         sourceType,
         academy,
+        authority,
+        isOfficial,
         years,
         maxYear: maxYear(years),
         tags: doc.tags ?? [],
+        metadata,
         titleTokens: new Set(tokenize(`${title} ${(doc.tags ?? []).join(" ")} ${academy}`)),
         contentTokens: new Set(tokenize(content)),
         normalizedTitle: normalizeText(title),
@@ -543,7 +862,10 @@ function heuristicIntent(question: string): IntentType {
 }
 
 function heuristicTopics(question: string): string[] {
-  const topics = TOPIC_HINTS.filter((hint) => question.includes(hint))
+  const topics = unique([
+    ...TOPIC_HINTS.filter((hint) => question.includes(hint)),
+    ...TOPIC_HINTS_ZH.filter((hint) => question.includes(hint)),
+  ])
   const tokens = tokenize(question).filter((token) => token.length >= 2 && token.length <= 8)
   return unique([...topics, ...tokens]).slice(0, 8)
 }
@@ -691,7 +1013,7 @@ function scoreChunk(
   if (plan.preferredSourceTypes.includes(chunk.sourceType)) {
     const rank = plan.preferredSourceTypes.indexOf(chunk.sourceType)
     score += clamp(7 - rank * 1.5, 1.5, 7)
-    reasons.push(`来源优先级 ${SOURCE_LABELS[chunk.sourceType]}`)
+    reasons.push(`来源优先级 ${sourceLabel(chunk.sourceType)}`)
   }
 
   if (
@@ -699,6 +1021,11 @@ function scoreChunk(
     chunk.sourceType === "official_policy"
   ) {
     score += 6
+  }
+
+  if (chunk.isOfficial) {
+    score += 1.5
+    reasons.push("官方口径")
   }
 
   if (plan.intent === "exam" && chunk.sourceType === "exam_recall") {
@@ -931,6 +1258,177 @@ function facetAwareApprovalIds(
   return unique(picked).slice(0, MAX_APPROVED)
 }
 
+function isOfficialChunk(chunk: KnowledgeChunk): boolean {
+  return chunk.isOfficial || chunk.sourceType === "official_policy"
+}
+
+function facetLabel(facet: EvidenceFacet): string {
+  switch (facet) {
+    case "eligibility":
+      return "资格要求"
+    case "exam":
+      return "考核方式"
+    case "process":
+      return "申请流程"
+    case "timeline":
+      return "时间节点"
+    case "quota":
+      return "名额计划"
+    case "grade":
+      return "年级限制"
+    default:
+      return "一般信息"
+  }
+}
+
+function approvedChunksFromIds(approvedIds: string[], retrieved: RetrievedChunk[]): KnowledgeChunk[] {
+  return approvedIds
+    .map((id) => retrieved.find((item) => item.chunk.id === id)?.chunk)
+    .filter((chunk): chunk is KnowledgeChunk => Boolean(chunk))
+}
+
+function maxFacetCoverage(chunk: KnowledgeChunk, facets: EvidenceFacet[]): number {
+  return Math.max(...facets.map((facet) => scoreFacetCoverage(chunk, facet)), 0)
+}
+
+function detectEvidenceConflicts(
+  question: string,
+  plan: PlannerResult,
+  retrieved: RetrievedChunk[],
+  approvedIds: string[],
+): string[] {
+  const conflicts: string[] = []
+  const facets = questionFacets(question, plan)
+  const requestedYears = new Set(plan.years)
+  const approvedChunks = approvedChunksFromIds(approvedIds, retrieved)
+
+  for (const facet of facets) {
+    const facetCandidates = retrieved
+      .map((item) => ({
+        chunk: item.chunk,
+        score: scoreFacetCoverage(item.chunk, facet),
+      }))
+      .filter((candidate) => candidate.score >= 4)
+      .sort((a, b) => b.score - a.score || b.chunk.maxYear - a.chunk.maxYear)
+      .slice(0, 4)
+
+    if (facetCandidates.length < 2) continue
+
+    const facetYears = unique(facetCandidates.flatMap((candidate) => candidate.chunk.years))
+    if (requestedYears.size === 0 && facetYears.length >= 2) {
+      conflicts.push(
+        `${facetLabel(facet)}同时命中了 ${facetYears.slice(0, 3).join("、")} 等不同年份材料，回答时应优先参考较新的口径。`,
+      )
+    }
+
+    const hasOfficial = facetCandidates.some((candidate) => isOfficialChunk(candidate.chunk))
+    const hasNonOfficial = facetCandidates.some((candidate) => !isOfficialChunk(candidate.chunk))
+    if (hasOfficial && hasNonOfficial) {
+      conflicts.push(
+        `${facetLabel(facet)}同时命中了官方与非官方资料，硬性规则应以官方材料为准，经验内容只能作为补充。`,
+      )
+    }
+  }
+
+  if (
+    approvedChunks.length > 0 &&
+    approvedChunks.some(isOfficialChunk) &&
+    approvedChunks.some((chunk) => !isOfficialChunk(chunk))
+  ) {
+    conflicts.push("最终证据同时包含官方与非官方材料，回答时需要显式区分硬性规则和经验补充。")
+  }
+
+  return sanitizeConflicts(conflicts)
+}
+
+function deriveRejectedIds(
+  question: string,
+  plan: PlannerResult,
+  retrieved: RetrievedChunk[],
+  approvedIds: string[],
+): string[] {
+  const approvedSet = new Set(approvedIds)
+  const facets = questionFacets(question, plan)
+  const approvedChunks = approvedChunksFromIds(approvedIds, retrieved)
+  const needsOfficial = ["policy", "eligibility", "process", "timeline", "exam"].includes(plan.intent)
+  const hasApprovedOfficial = approvedChunks.some(isOfficialChunk)
+  const newestApprovedByGroup = new Map<string, number>()
+
+  for (const chunk of approvedChunks) {
+    const groupKey = `${chunk.academy}|${chunk.sourceType}`
+    const current = newestApprovedByGroup.get(groupKey) ?? 0
+    newestApprovedByGroup.set(groupKey, Math.max(current, chunk.maxYear))
+  }
+
+  return retrieved
+    .filter((item) => !approvedSet.has(item.chunk.id))
+    .filter((item) => {
+      if (maxFacetCoverage(item.chunk, facets) <= 0) {
+        return true
+      }
+
+      if (needsOfficial && hasApprovedOfficial && plan.intent !== "exam" && !isOfficialChunk(item.chunk)) {
+        return true
+      }
+
+      if (plan.years.length === 0) {
+        const groupKey = `${item.chunk.academy}|${item.chunk.sourceType}`
+        const newestApproved = newestApprovedByGroup.get(groupKey) ?? 0
+        if (newestApproved > 0 && item.chunk.maxYear > 0 && newestApproved > item.chunk.maxYear) {
+          return true
+        }
+      }
+
+      return false
+    })
+    .map((item) => item.chunk.id)
+    .slice(0, MAX_RETRIEVED)
+}
+
+function deriveReviewConfidence(
+  question: string,
+  plan: PlannerResult,
+  approvedChunks: KnowledgeChunk[],
+  conflicts: string[],
+  missingOfficialEvidence: boolean,
+): ReviewConfidence {
+  const facets = questionFacets(question, plan)
+  const coveredFacets = facets.filter((facet) =>
+    approvedChunks.some((chunk) => scoreFacetCoverage(chunk, facet) >= 3),
+  )
+
+  if (coveredFacets.length === facets.length && !missingOfficialEvidence && conflicts.length === 0) {
+    return "high"
+  }
+
+  if (coveredFacets.length >= Math.max(1, facets.length - 1) && !missingOfficialEvidence) {
+    return "medium"
+  }
+
+  if (coveredFacets.length > 0 && (plan.intent === "exam" || conflicts.length === 0)) {
+    return "medium"
+  }
+
+  return "low"
+}
+
+function deriveAnswerStrategy(
+  plan: PlannerResult,
+  missingOfficialEvidence: boolean,
+  conflicts: string[],
+): string {
+  if (missingOfficialEvidence) {
+    return "先说明哪些硬性规则缺少充分官方证据，再只回答当前可确认的部分。"
+  }
+  if (conflicts.length > 0) {
+    return "先给出更稳妥的结论，并明确不同材料之间的口径差异。"
+  }
+  if (plan.intent === "exam") {
+    return "先回答官方考核规则，再补充回忆题和准备建议。"
+  }
+  return "直接回答。"
+}
+
 function extractJsonPayload(text: string): string | null {
   const fencedMatch = /```(?:json)?\s*([\s\S]*?)```/i.exec(text)
   const source = (fencedMatch?.[1] ?? text).trim()
@@ -1107,21 +1605,28 @@ function plannerFallback(
 
 function reviewerFallback(question: string, plan: PlannerResult, retrieved: RetrievedChunk[]): ReviewResult {
   const approvedIds = facetAwareApprovalIds(question, plan, retrieved)
-  const approvedChunks = approvedIds
-    .map((id) => retrieved.find((item) => item.chunk.id === id)?.chunk)
-    .filter((chunk): chunk is KnowledgeChunk => Boolean(chunk))
-  const hasOfficial = approvedChunks.some((chunk) => chunk.sourceType === "official_policy")
+  const approvedChunks = approvedChunksFromIds(approvedIds, retrieved)
+  const hasOfficial = approvedChunks.some(isOfficialChunk)
   const needsOfficial = ["policy", "eligibility", "process", "timeline", "exam"].includes(plan.intent)
+  const missingOfficialEvidence = needsOfficial && !hasOfficial
+  const conflicts = detectEvidenceConflicts(question, plan, retrieved, approvedIds)
+  const rejectedIds = deriveRejectedIds(question, plan, retrieved, approvedIds)
+  const confidence = deriveReviewConfidence(
+    question,
+    plan,
+    approvedChunks,
+    conflicts,
+    missingOfficialEvidence,
+  )
 
   return {
     approvedIds,
-    rejectedIds: [],
-    conflicts: [],
-    missingOfficialEvidence: needsOfficial && !hasOfficial,
-    confidence: hasOfficial && approvedIds.length >= 3 ? "high" : hasOfficial ? "medium" : "low",
-    answerStrategy: needsOfficial && !hasOfficial ? "如实说明站内官方证据不足，再给出可确认的信息。" : "直接回答。",
+    rejectedIds,
+    conflicts,
+    missingOfficialEvidence,
+    confidence,
+    answerStrategy: deriveAnswerStrategy(plan, missingOfficialEvidence, conflicts),
   }
-
 }
 
 function normalizeReviewResult(
@@ -1145,35 +1650,36 @@ function normalizeReviewResult(
     ? candidate.rejectedIds.filter(
         (id): id is string => typeof id === "string" && validIds.has(id) && !approvedIds.includes(id),
       )
-    : []
+    : fallback.rejectedIds
 
-  const approvedChunks = approvedIds
-    .map((id) => retrieved.find((item) => item.chunk.id === id)?.chunk)
-    .filter((chunk): chunk is KnowledgeChunk => Boolean(chunk))
+  const approvedChunks = approvedChunksFromIds(approvedIds, retrieved)
 
-  const hasOfficial = approvedChunks.some((chunk) => chunk.sourceType === "official_policy")
+  const hasOfficial = approvedChunks.some(isOfficialChunk)
   const needsOfficial = ["policy", "eligibility", "process", "timeline", "exam"].includes(plan.intent)
-  const confidence =
-    typeof candidate.confidence === "string" &&
-    REVIEW_CONFIDENCE_VALUES.includes(candidate.confidence as ReviewConfidence)
-      ? (candidate.confidence as ReviewConfidence)
-      : fallback.confidence
+  const missingOfficialEvidence = needsOfficial && !hasOfficial
+  const fallbackConflicts = fallback.conflicts
+
+  const conflicts = sanitizeConflicts([
+    ...fallbackConflicts,
+    ...(Array.isArray(candidate.conflicts)
+      ? candidate.conflicts.filter((conflict): conflict is string => typeof conflict === "string")
+      : []),
+  ])
+  const confidence = deriveReviewConfidence(
+    question,
+    plan,
+    approvedChunks,
+    conflicts,
+    missingOfficialEvidence,
+  )
 
   return {
     approvedIds: approvedIds.length > 0 ? approvedIds : fallback.approvedIds,
     rejectedIds,
-    conflicts: sanitizeConflicts(
-      Array.isArray(candidate.conflicts)
-        ? candidate.conflicts.filter((conflict): conflict is string => typeof conflict === "string")
-        : fallback.conflicts,
-    ),
-    missingOfficialEvidence: needsOfficial && !hasOfficial,
-    confidence:
-      hasOfficial && confidence === "low" ? "medium" : !hasOfficial && confidence === "high" ? "medium" : confidence,
-    answerStrategy:
-      typeof candidate.answerStrategy === "string" && stripMarkupNoise(candidate.answerStrategy)
-        ? stripMarkupNoise(candidate.answerStrategy)
-        : fallback.answerStrategy,
+    conflicts,
+    missingOfficialEvidence,
+    confidence,
+    answerStrategy: deriveAnswerStrategy(plan, missingOfficialEvidence, conflicts),
   }
 }
 
@@ -1670,7 +2176,7 @@ class ChatbotRuntime {
     try {
       const raw = localStorage.getItem(STORAGE_KEY)
       if (!raw) {
-        return { profile: { ...EMPTY_PROFILE }, history: [] }
+        return { profile: { ...EMPTY_PROFILE }, history: [], rollingSummary: "" }
       }
       const parsed = JSON.parse(raw) as StoredSession
       return {
@@ -1682,9 +2188,10 @@ class ChatbotRuntime {
           compareMode: Boolean(parsed.profile?.compareMode),
         },
         history: Array.isArray(parsed.history) ? parsed.history.slice(-MAX_HISTORY) : [],
+        rollingSummary: typeof parsed.rollingSummary === "string" ? parsed.rollingSummary : "",
       }
     } catch {
-      return { profile: { ...EMPTY_PROFILE }, history: [] }
+      return { profile: { ...EMPTY_PROFILE }, history: [], rollingSummary: "" }
     }
   }
 
@@ -1695,6 +2202,7 @@ class ChatbotRuntime {
         JSON.stringify({
           profile: this.session.profile,
           history: this.session.history.slice(-MAX_HISTORY),
+          rollingSummary: this.session.rollingSummary,
         }),
       )
     } catch {
@@ -1753,7 +2261,7 @@ class ChatbotRuntime {
   }
 
   private resetConversation() {
-    this.session = { profile: { ...EMPTY_PROFILE }, history: [] }
+    this.session = { profile: { ...EMPTY_PROFILE }, history: [], rollingSummary: "" }
     this.persistSession()
 
     if (!this.messagesEl) return
@@ -1866,6 +2374,7 @@ class ChatbotRuntime {
 
     const question = (overrideQuestion ?? this.inputEl.value).trim()
     if (!question) return
+    const effectiveTurn = buildEffectiveQuestion(question, this.session)
 
     this.inputEl.value = ""
     this.resizeInput()
@@ -1878,7 +2387,7 @@ class ChatbotRuntime {
     this.syncWelcomeState()
     this.appendMessage("user", userHtml(userMessage))
 
-    const instantReply = quickReply(question)
+    const instantReply = effectiveTurn.isSupplement ? null : quickReply(question)
     if (instantReply) {
       const assistantMessage: StoredMessage = { role: "assistant", content: instantReply }
       this.session.history.push(assistantMessage)
@@ -1895,13 +2404,19 @@ class ChatbotRuntime {
 
     try {
       const knowledgeBase = await getKnowledgeBase()
-      const plan = await this.plan(question, knowledgeBase, controller.signal)
+      const contextualized = await this.contextualize(
+        question,
+        knowledgeBase,
+        controller.signal,
+        effectiveTurn,
+      )
 
-      if (plan.needClarification && plan.clarificationQuestion) {
+      if (contextualized.needClarification && contextualized.clarificationQuestion) {
+        this.session.rollingSummary = contextualized.rollingSummary
         this.removeTyping()
         const clarification: StoredMessage = {
           role: "assistant",
-          content: plan.clarificationQuestion,
+          content: contextualized.clarificationQuestion,
         }
         this.session.history.push(clarification)
         this.session.history = this.session.history.slice(-MAX_HISTORY)
@@ -1910,11 +2425,20 @@ class ChatbotRuntime {
         return
       }
 
-      const retrieved = retrieveChunks(question, plan, knowledgeBase)
-      const review = await this.review(question, plan, retrieved, controller.signal)
-      const normalizedReview = normalizeReviewResult(review, question, plan, retrieved)
-      const approved = this.materializeEvidence(normalizedReview, retrieved)
-      const answerText = await this.answer(question, plan, normalizedReview, approved, controller.signal)
+      const retrieved = retrieveChunks(contextualized.standaloneQuestion, contextualized, knowledgeBase)
+      const review = await this.review(
+        contextualized.standaloneQuestion,
+        contextualized,
+        retrieved,
+      )
+      const approved = this.materializeEvidence(review, retrieved)
+      const answerText = await this.answer(
+        contextualized.standaloneQuestion,
+        contextualized,
+        review,
+        approved,
+        controller.signal,
+      )
       const assistantMessage: StoredMessage = {
         role: "assistant",
         content: answerText,
@@ -1928,13 +2452,14 @@ class ChatbotRuntime {
             academy: item.chunk.academy,
             years: item.chunk.years,
           })),
-          conflicts: normalizedReview.conflicts,
-          missingOfficialEvidence: normalizedReview.missingOfficialEvidence,
-          confidence: normalizedReview.confidence,
+          conflicts: review.conflicts,
+          missingOfficialEvidence: review.missingOfficialEvidence,
+          confidence: review.confidence,
         },
       }
 
-      this.mergeProfile(plan)
+      this.session.rollingSummary = contextualized.rollingSummary
+      this.mergeProfile(contextualized)
       this.session.history.push(assistantMessage)
       this.session.history = this.session.history.slice(-MAX_HISTORY)
       this.persistSession()
@@ -1998,116 +2523,43 @@ class ChatbotRuntime {
     return ordered
   }
 
-  private async plan(
+  private async contextualize(
     question: string,
     knowledgeBase: KnowledgeBase,
     signal: AbortSignal,
-  ): Promise<PlannerResult> {
-    const draft = plannerFallback(question, this.session, knowledgeBase)
+    preparedTurn?: EffectiveTurn,
+  ): Promise<ContextualizedPlan> {
+    const fallback = contextualizeFallback(question, this.session, knowledgeBase, preparedTurn)
     if (!this.config.model.trim()) {
-      return draft
-    }
-
-    const sessionSummary = [
-      this.session.profile.academies.length > 0
-        ? `上文提到的学院: ${this.session.profile.academies.join("、")}`
-        : "",
-      this.session.profile.years.length > 0
-        ? `上文提到的年份: ${this.session.profile.years.join("、")}`
-        : "",
-      this.session.profile.topics.length > 0
-        ? `上文提到的话题: ${this.session.profile.topics.join("、")}`
-        : "",
-    ]
-      .filter(Boolean)
-      .join("\n")
-
-    const prompt = [
-      "你是检索规划器。只根据用户问题和已有上下文，输出一个 JSON 对象，不要输出解释。",
-      "不要编造学院、年份或政策结论。问题已经足够明确时，不要要求澄清。",
-      "字段: intent, academies, years, topics, compareMode, preferLatest, needClarification, clarificationQuestion, queryVariants, preferredSourceTypes。",
-      "intent 只能是: policy, eligibility, process, timeline, academy_info, academy_compare, exam, secondary_selection, community, general。",
-      "preferredSourceTypes 只能从: official_policy, academy_summary, editorial_summary, secondary_selection, exam_recall, community, general 中选择。",
-      "",
-      `用户问题: ${question}`,
-      sessionSummary ? `会话上下文:\n${sessionSummary}` : "",
-      `本地草案: ${JSON.stringify(draft)}`,
-    ]
-      .filter(Boolean)
-      .join("\n\n")
-
-    try {
-      const raw = await this.complete(
-        [
-          {
-            role: "system",
-            content: "你负责把用户问题转成检索计划。回答必须是 JSON 对象。",
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-        signal,
-        0,
-        700,
-      )
-
-      return normalizePlannerResult(parseJsonObject<Partial<PlannerResult>>(raw), draft, knowledgeBase)
-    } catch (error) {
-      if (isAbortError(error)) throw error
-      return draft
-    }
-  }
-
-  private async review(
-    question: string,
-    plan: PlannerResult,
-    retrieved: RetrievedChunk[],
-    signal: AbortSignal,
-  ): Promise<ReviewResult> {
-    const fallback = reviewerFallback(question, plan, retrieved)
-    if (!this.config.model.trim() || retrieved.length === 0) {
       return fallback
     }
 
-    const candidateSummary = retrieved
-      .slice(0, MAX_RETRIEVED)
-      .map((item, index) =>
-        [
-          `候选 ${index + 1}`,
-          `id: ${item.chunk.id}`,
-          `标题: ${item.chunk.title}`,
-          `来源: ${SOURCE_LABELS[item.chunk.sourceType]}`,
-          `学院: ${item.chunk.academy || "未标注"}`,
-          `年份: ${item.chunk.years.join("、") || "未标注"}`,
-          `检索分: ${item.score.toFixed(2)}`,
-          `检索理由: ${item.reasons.join("；") || "无"}`,
-          `问题分面: ${questionFacets(question, plan).join("、")}`,
-          `摘要摘录: ${pickRelevantExcerpt(question, plan, item.chunk)}`,
-          `原文块:\n${item.chunk.content.trim()}`,
-        ].join("\n"),
-      )
-      .join("\n\n")
-
     const prompt = [
-      "你是证据审稿器。只根据候选资料挑选足以回答问题的证据，输出 JSON 对象，不要输出解释。",
-      "目标是覆盖用户问题里的每个子问题；如果用户同时问“要求 + 怎么考”，必须两部分都覆盖。",
-      "优先官方政策；历年真题/回忆可以补充考试准备，但不要拿它替代官方结论。",
-      "字段: approvedIds, rejectedIds, conflicts, missingOfficialEvidence, confidence, answerStrategy。",
-      "confidence 只能是 high, medium, low。",
-      "",
-      `用户问题: ${question}`,
-      `规划结果: ${JSON.stringify(plan)}`,
-      `候选资料:\n${candidateSummary}`,
-    ].join("\n\n")
+      "你是会话上下文化器兼检索规划器。你只能输出一个 JSON 对象。",
+      "你的任务是把当前输入改写成单轮可理解问题，并生成检索规划。",
+      "如果用户这轮只补充课程名、年份、分数、学院、是否面试等片段信息，必须结合历史上下文补全成完整问题。",
+      "只有在缺少必要信息、确实无法继续检索时，才允许 needClarification=true。",
+      "不要编造学院、年份、政策、考核方式或结论。",
+      "字段: standaloneQuestion, rollingSummary, intent, academies, years, topics, compareMode, preferLatest, needClarification, clarificationQuestion, queryVariants, preferredSourceTypes。",
+      "rollingSummary 用不超过 120 个汉字总结长期上下文，只保留后续检索还需要的信息。",
+      "intent 只能是: policy, eligibility, process, timeline, academy_info, academy_compare, exam, secondary_selection, community, general。",
+      "preferredSourceTypes 只能从: official_policy, academy_summary, editorial_summary, secondary_selection, exam_recall, community, general 中选择。",
+      `当前输入: ${preparedTurn?.questionForModel ?? question}`,
+      this.session.rollingSummary ? `已有摘要: ${this.session.rollingSummary}` : "已有摘要: 无",
+      this.session.history.length > 0
+        ? `最近对话:\n${recentConversationSummary(this.session.history, 6)}`
+        : "最近对话: 无",
+      `本地草案: ${JSON.stringify(fallback)}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n")
 
     try {
       const raw = await this.complete(
         [
           {
             role: "system",
-            content: "你负责审查证据覆盖面并输出 JSON 对象。",
+            content: "你负责把多轮对话压缩成当前可检索的问题，并输出 JSON 对象。",
           },
           {
             role: "user",
@@ -2119,11 +2571,23 @@ class ChatbotRuntime {
         900,
       )
 
-      return normalizeReviewResult(parseJsonObject<Partial<ReviewResult>>(raw), question, plan, retrieved)
+      return normalizeContextualizedPlan(
+        parseJsonObject<Partial<ContextualizedPlan>>(raw),
+        fallback,
+        knowledgeBase,
+      )
     } catch (error) {
       if (isAbortError(error)) throw error
       return fallback
     }
+  }
+
+  private async review(
+    question: string,
+    plan: PlannerResult,
+    retrieved: RetrievedChunk[],
+  ): Promise<ReviewResult> {
+    return normalizeReviewResult(reviewerFallback(question, plan, retrieved), question, plan, retrieved)
   }
 
   private async answer(
@@ -2137,8 +2601,8 @@ class ChatbotRuntime {
       return fallbackAnswer(question, plan, evidence, review)
     }
 
-    const facets = questionFacets(question, plan)
-    const evidenceSummary = evidence
+    const answerFacets = questionFacets(question, plan)
+    const answerEvidenceSummary = evidence
       .slice(0, MAX_APPROVED)
       .map((item) =>
         [
@@ -2146,7 +2610,7 @@ class ChatbotRuntime {
           `[${item.label}] 学院: ${item.chunk.academy || "未标注"}`,
           `[${item.label}] 年份: ${item.chunk.years.join("、") || "无"}`,
           `[${item.label}] 来源类型: ${item.chunk.sourceType}`,
-          `[${item.label}] 来源说明: ${SOURCE_LABELS[item.chunk.sourceType]}`,
+          `[${item.label}] 来源说明: ${sourceLabel(item.chunk.sourceType)}`,
           `[${item.label}] 相关摘录: ${pickRelevantExcerpt(question, plan, item.chunk)}`,
           `[${item.label}] 原文:\n${item.chunk.content.trim()}`,
         ].join("\n"),
@@ -2154,35 +2618,31 @@ class ChatbotRuntime {
       .join("\n\n")
 
     const prompt = [
-      "你是中山大学转专业咨询助手。",
-      "你要用简体中文作答，语气礼貌、热情、专业，像一个认真帮学生梳理问题的学长或助理老师。",
-      "但你必须严格受证据约束，不能编造政策、年份、分数线、考核形式、流程或结论。",
-      "请把答案写成聊天回复，而不是生硬报告。",
-      "作答规则：",
-      "1. 先直接回答学生最想知道的内容。",
-      "2. 如果问题里有多个子问题，要在一条自然的回答里都覆盖到。",
-      "3. 涉及硬性要求、成绩门槛、流程、时间、录取比例、总成绩构成、是否面试等，优先以官方政策为准。",
-      "4. 历年回忆、经验贴、整理稿只能作为补充，适合用来讲准备方向或历史情况，不能压过官方口径。",
-      "5. 只有具体事实、数字、规则后面才加 [E1] 这种证据标签，不要每句话都加。",
-      "6. 不要输出“结论 / 依据 / 不确定项 / 参考依据”这类僵硬标题，除非问题本身真的需要。",
-      "7. 不要单独再列一个参考资料区，也不要机械重复材料标题。",
-      "8. 如果某一部分证据不够，直接简短说清楚，不要把不确定内容说得太满。",
-      "9. 如果不同年份口径有变化，用自然一句话概括变化点。",
-      "10. 默认用短段落；只有内容天然适合列点时才用短要点。",
-      "11. 如果合适，最后补一句有针对性的准备建议。",
-      "",
+      "你是一个礼貌、热情、专业的大学转专业咨询助手。请用简体中文自然作答。",
+      "你必须严格受证据约束，不能编造政策、年份、分数线、考核形式、流程或结论。",
+      "回答规则：",
+      "1. 第一段先直接回答用户当前最想知道的结论，不要先讲背景。",
+      "2. 如果问题包含多个子问题，要在同一条自然回答里都覆盖到，不要只答一半。",
+      "3. 默认用 2 到 4 段短段落；只有内容天然适合列点时才用短列表。",
+      "4. 不要写成“结论 / 依据 / 不确定项 / 参考依据”这种模板，也不要机械重复材料标题。",
+      "5. 涉及硬性规则、分数门槛、时间节点、考核结构时，优先引用官方证据；回忆版只能用于补充准备建议和历史情况。",
+      "6. 只有具体事实后面才加 [E1] 这类标签，不要几乎每句都加。",
+      "7. 如果证据不足，就明确说哪一部分不能确定，但仍先回答能确定的部分。",
+      "8. 最后一段如果合适，可以补一句很具体的下一步建议。",
       `问题：${question}`,
       `意图：${plan.intent}`,
-      facets.length > 0 ? `问题侧面：${facets.join("、")}` : "",
+      answerFacets.length > 0 ? `问题侧面：${answerFacets.join("、")}` : "",
       plan.academies.length > 0 ? `目标学院：${plan.academies.join("、")}` : "",
       plan.years.length > 0 ? `涉及年份：${plan.years.join("、")}` : "",
       review.conflicts.length > 0 ? `已知口径差异：${review.conflicts.join(" | ")}` : "",
       review.missingOfficialEvidence
-        ? "提示：官方政策证据对问题的至少一部分覆盖不足，回答时要明确说清。"
+        ? "提示：至少有一部分问题缺少充分的官方原文证据，回答时要明确说清。"
         : "提示：已命中官方证据，涉及硬信息时应以官方证据为主。",
-      `审核置信度：${review.confidence}`,
-      `证据：\n${evidenceSummary}`,
-    ].join("\n\n")
+      `证据置信度：${review.confidence}`,
+      `证据：\n${answerEvidenceSummary}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n")
 
     try {
       return await this.complete(
@@ -2281,24 +2741,37 @@ class ChatbotRuntime {
   }
 }
 
-document.addEventListener("nav", () => {
-  const root = document.querySelector<HTMLElement>(".chatbot-page")
-  if (!root) return
+if (typeof document !== "undefined") {
+  document.addEventListener("nav", () => {
+    const root = document.querySelector<HTMLElement>(".chatbot-page")
+    if (!root) return
 
-  chatbotState.__sysuRemajorChatbotState = chatbotState.__sysuRemajorChatbotState ?? {}
+    chatbotState.__sysuRemajorChatbotState = chatbotState.__sysuRemajorChatbotState ?? {}
 
-  if (chatbotState.__sysuRemajorChatbotState.runtime) {
-    chatbotState.__sysuRemajorChatbotState.runtime.destroy()
-  }
-
-  const runtime = new ChatbotRuntime(root)
-  chatbotState.__sysuRemajorChatbotState.runtime = runtime
-  runtime.mount()
-
-  window.addCleanup(() => {
-    runtime.destroy()
-    if (chatbotState.__sysuRemajorChatbotState?.runtime === runtime) {
-      chatbotState.__sysuRemajorChatbotState.runtime = null
+    if (chatbotState.__sysuRemajorChatbotState.runtime) {
+      chatbotState.__sysuRemajorChatbotState.runtime.destroy()
     }
+
+    const runtime = new ChatbotRuntime(root)
+    chatbotState.__sysuRemajorChatbotState.runtime = runtime
+    runtime.mount()
+
+    window.addCleanup(() => {
+      runtime.destroy()
+      if (chatbotState.__sysuRemajorChatbotState?.runtime === runtime) {
+        chatbotState.__sysuRemajorChatbotState.runtime = null
+      }
+    })
   })
-})
+}
+
+export {
+  assistantHtml,
+  buildEffectiveQuestion,
+  buildKnowledgeBase,
+  contextualizeFallback,
+  modelUnavailableAnswer,
+  normalizeReviewResult,
+  retrieveChunks,
+  reviewerFallback,
+}

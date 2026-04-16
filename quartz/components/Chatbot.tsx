@@ -8,7 +8,6 @@ import { resolve } from "path"
 
 const CHATBOT_ENV_KEYS = ["CHATBOT_API_KEY", "CHATBOT_API_BASE", "CHATBOT_MODEL"] as const
 
-// Load .env file at build time if chatbot env vars are not already set
 function loadEnvIfNeeded() {
   if (CHATBOT_ENV_KEYS.every((key) => (process.env[key] ?? "").trim())) {
     return
@@ -32,7 +31,7 @@ function loadEnvIfNeeded() {
       }
     }
   } catch {
-    // Silently ignore - env vars should be set via CI/CD
+    // Ignore .env parse failures in CI/CD. GitHub Actions should provide env vars.
   }
 }
 
@@ -51,11 +50,8 @@ export default (() => {
         data-api-base={apiBase}
         data-model={model}
       >
-        {/* Chat Container */}
         <div class="chatbot-chat">
-          {/* Messages Area */}
           <div class="chatbot-messages" id="chatbot-messages">
-            {/* Welcome Screen */}
             <div class="chatbot-welcome">
               <div class="chatbot-welcome-avatar">
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="36" height="36">
@@ -69,7 +65,6 @@ export default (() => {
                 请注意，我的回答仅供参考，具体政策请以教务部和学院当年通知为准。
               </p>
             </div>
-            {/* Preset Questions */}
             <div class="chatbot-presets" id="chatbot-presets">
               <button class="chatbot-preset-btn" data-question="转专业的基本流程是什么？">
                 <span class="chatbot-preset-icon">📋</span>
@@ -98,7 +93,6 @@ export default (() => {
             </div>
           </div>
 
-          {/* Input Area */}
           <div class="chatbot-input-area">
             <div class="chatbot-input-wrapper">
               <textarea
@@ -110,7 +104,8 @@ export default (() => {
               <div class="chatbot-actions-group">
                 <button class="chatbot-clear" id="chatbot-clear" aria-label="清空对话" title="新对话">
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
-                    <line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line>
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
                   </svg>
                 </button>
                 <button class="chatbot-send" id="chatbot-send" aria-label="发送">

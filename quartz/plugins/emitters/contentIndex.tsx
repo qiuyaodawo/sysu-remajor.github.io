@@ -9,6 +9,25 @@ import { write } from "./helpers"
 import { i18n } from "../../i18n"
 
 export type ContentIndexMap = Map<FullSlug, ContentDetails>
+export type MetadataSourceType =
+  | "official_policy"
+  | "academy_summary"
+  | "editorial_summary"
+  | "secondary_selection"
+  | "exam_recall"
+  | "community"
+  | "general"
+
+export type ContentMetadata = {
+  sourceType?: MetadataSourceType
+  policyYear?: number[]
+  academy?: string
+  authority?: string
+  isOfficial?: boolean
+  faculty?: string
+  campus?: string
+}
+
 export type ContentDetails = {
   slug: FullSlug
   filePath: FilePath
@@ -19,7 +38,10 @@ export type ContentDetails = {
   richContent?: string
   date?: Date
   description?: string
+  metadata?: ContentMetadata
 }
+
+type FrontmatterLike = Record<string, unknown>
 
 interface Options {
   enableSiteMap: boolean
@@ -37,6 +59,105 @@ const defaultOptions: Options = {
   rssFullHtml: false,
   rssSlug: "index",
   includeEmptyFiles: true,
+}
+
+const metadataSourceTypes = new Set<MetadataSourceType>([
+  "official_policy",
+  "academy_summary",
+  "editorial_summary",
+  "secondary_selection",
+  "exam_recall",
+  "community",
+  "general",
+])
+
+function readFrontmatterString(frontmatter: FrontmatterLike | undefined, key: string): string | undefined {
+  const value = frontmatter?.[key]
+  if (typeof value !== "string") {
+    return undefined
+  }
+
+  const normalized = value.trim()
+  return normalized === "" ? undefined : normalized
+}
+
+function readFrontmatterStringArray(frontmatter: FrontmatterLike | undefined, key: string): string[] | undefined {
+  const value = frontmatter?.[key]
+  if (!Array.isArray(value)) {
+    return undefined
+  }
+
+  return value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item) => item !== "")
+}
+
+function readFrontmatterBoolean(frontmatter: FrontmatterLike | undefined, key: string): boolean | undefined {
+  const value = frontmatter?.[key]
+  if (typeof value === "boolean") {
+    return value
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase()
+    if (normalized === "true") {
+      return true
+    }
+
+    if (normalized === "false") {
+      return false
+    }
+  }
+
+  return undefined
+}
+
+function normalizeFrontmatterYears(rawValues: unknown[]): number[] {
+  return [...new Set(
+    rawValues.flatMap((value) => {
+      if (typeof value === "number" && Number.isInteger(value) && value >= 1000 && value <= 9999) {
+        return [value]
+      }
+
+      if (typeof value === "string") {
+        const normalized = value.trim()
+        if (/^\d{4}$/.test(normalized)) {
+          return [Number(normalized)]
+        }
+      }
+
+      return []
+    }),
+  )].sort((a, b) => b - a)
+}
+
+function readFrontmatterYears(frontmatter: FrontmatterLike | undefined, key: string): number[] | undefined {
+  const value = frontmatter?.[key]
+  if (typeof value === "undefined" || value === null) {
+    return undefined
+  }
+
+  const years = normalizeFrontmatterYears(Array.isArray(value) ? value : [value])
+  return years.length > 0 ? years : undefined
+}
+
+export function extractContentMetadata(frontmatter: FrontmatterLike | undefined): ContentMetadata | undefined {
+  const sourceType = readFrontmatterString(frontmatter, "sourceType")
+  const metadata: ContentMetadata = {
+    sourceType:
+      sourceType && metadataSourceTypes.has(sourceType as MetadataSourceType)
+        ? (sourceType as MetadataSourceType)
+        : undefined,
+    policyYear: readFrontmatterYears(frontmatter, "policyYear"),
+    academy: readFrontmatterString(frontmatter, "academy"),
+    authority: readFrontmatterString(frontmatter, "authority"),
+    isOfficial: readFrontmatterBoolean(frontmatter, "isOfficial"),
+    faculty: readFrontmatterString(frontmatter, "faculty"),
+    campus: readFrontmatterString(frontmatter, "campus"),
+  }
+
+  return Object.values(metadata).some((value) => value !== undefined) ? metadata : undefined
 }
 
 function generateSiteMap(cfg: GlobalConfiguration, idx: ContentIndexMap): string {
@@ -102,19 +223,21 @@ export const ContentIndex: QuartzEmitterPlugin<Partial<Options>> = (opts) => {
       for (const [tree, file] of content) {
         const slug = file.data.slug!
         const date = getDate(ctx.cfg.configuration, file.data) ?? new Date()
+        const frontmatter = file.data.frontmatter as FrontmatterLike | undefined
         if (opts?.includeEmptyFiles || (file.data.text && file.data.text !== "")) {
           linkIndex.set(slug, {
             slug,
             filePath: file.data.relativePath!,
-            title: file.data.frontmatter?.title!,
+            title: readFrontmatterString(frontmatter, "title") ?? "",
             links: file.data.links ?? [],
-            tags: file.data.frontmatter?.tags ?? [],
+            tags: readFrontmatterStringArray(frontmatter, "tags") ?? [],
             content: file.data.text ?? "",
             richContent: opts?.rssFullHtml
               ? escapeHTML(toHtml(tree as Root, { allowDangerousHtml: true }))
               : undefined,
             date: date,
             description: file.data.description ?? "",
+            metadata: extractContentMetadata(frontmatter),
           })
         }
       }

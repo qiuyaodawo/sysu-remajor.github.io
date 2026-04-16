@@ -269,12 +269,13 @@ export async function handleBuild(argv) {
           build.onLoad({ filter: /\.inline\.(ts|js)$/ }, async (args) => {
             let text = await promises.readFile(args.path, "utf8")
 
-            // remove default exports that we manually inserted
-            text = text.replace("export default", "")
-            text = text.replace("export", "")
+            // Remove ESM exports before bundling inline scripts as plain text.
+            // Some inline scripts keep named exports for local tests/utilities.
+            text = text.replace(/\bexport\s+default\b/g, "")
+            text = text.replace(/\bexport\s*\{[\s\S]*?\}\s*;?\s*$/m, "")
 
-            const sourcefile = path.relative(path.resolve("."), args.path)
-            const resolveDir = path.dirname(sourcefile)
+            const sourcefile = args.path
+            const resolveDir = path.dirname(args.path)
             const transpiled = await esbuild.build({
               stdin: {
                 contents: text,
@@ -318,7 +319,8 @@ export async function handleBuild(argv) {
 
     const result = await ctx.rebuild().catch((err) => {
       console.error(`${styleText("red", "Couldn't parse Quartz configuration:")} ${fp}`)
-      console.log(`Reason: ${styleText("grey", err)}`)
+      const reason = err instanceof Error ? err.stack ?? err.message : String(err)
+      console.log(`Reason: ${styleText("grey", reason)}`)
       process.exit(1)
     })
     release()
