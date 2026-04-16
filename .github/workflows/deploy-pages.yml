@@ -18,6 +18,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +33,82 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Validate chatbot configuration
+        env:
+          CHATBOT_API_KEY: ${{ secrets.CHATBOT_API_KEY }}
+          CHATBOT_API_BASE: ${{ vars.CHATBOT_API_BASE || secrets.CHATBOT_API_BASE }}
+          CHATBOT_MODEL: ${{ vars.CHATBOT_MODEL || secrets.CHATBOT_MODEL }}
+        run: |
+          if [ -z "$CHATBOT_API_KEY" ] || [ -z "$CHATBOT_API_BASE" ] || [ -z "$CHATBOT_MODEL" ]; then
+            echo "CHATBOT_API_KEY, CHATBOT_API_BASE, and CHATBOT_MODEL must be set for GitHub Pages builds."
+            exit 1
+          fi
+          case "$CHATBOT_API_BASE" in
+            https://*) ;;
+            *)
+              echo "CHATBOT_API_BASE must use https:// on GitHub Pages."
+              exit 1
+              ;;
+          esac
+
+      - name: Verify chatbot CORS preflight
+        env:
+          CHATBOT_API_BASE: ${{ vars.CHATBOT_API_BASE || secrets.CHATBOT_API_BASE }}
+        run: |
+          endpoint="${CHATBOT_API_BASE%/}"
+          case "$endpoint" in
+            */chat/completions) ;;
+            *) endpoint="$endpoint/chat/completions" ;;
+          esac
+
+          headers_file="$(mktemp)"
+          status_code="$(curl --silent --show-error --output /dev/null \
+            --write-out "%{http_code}" \
+            --dump-header "$headers_file" \
+            --request OPTIONS "$endpoint" \
+            --header "Origin: https://sysu-remajor.github.io" \
+            --header "Access-Control-Request-Method: POST" \
+            --header "Access-Control-Request-Headers: authorization,content-type")"
+
+          if [ "$status_code" -lt 200 ] || [ "$status_code" -ge 400 ]; then
+            echo "Chatbot API preflight failed with HTTP $status_code."
+            cat "$headers_file"
+            exit 1
+          fi
+
+          allow_origin="$(grep -i '^access-control-allow-origin:' "$headers_file" | tail -n1 | cut -d: -f2- | tr -d '\r' | xargs || true)"
+          allow_methods="$(grep -i '^access-control-allow-methods:' "$headers_file" | tail -n1 | cut -d: -f2- | tr -d '\r' | tr '[:upper:]' '[:lower:]' | xargs || true)"
+          allow_headers="$(grep -i '^access-control-allow-headers:' "$headers_file" | tail -n1 | cut -d: -f2- | tr -d '\r' | tr '[:upper:]' '[:lower:]' | xargs || true)"
+
+          if [ "$allow_origin" != "*" ] && [ "$allow_origin" != "https://sysu-remajor.github.io" ]; then
+            echo "Chatbot API must allow Origin https://sysu-remajor.github.io or *."
+            cat "$headers_file"
+            exit 1
+          fi
+
+          if [[ "$allow_methods" != *post* ]]; then
+            echo "Chatbot API must allow POST in Access-Control-Allow-Methods."
+            cat "$headers_file"
+            exit 1
+          fi
+
+          if [ "$allow_headers" != "*" ] && [[ "$allow_headers" != *authorization* ]]; then
+            echo "Chatbot API must allow authorization in Access-Control-Allow-Headers."
+            cat "$headers_file"
+            exit 1
+          fi
+
+          if [ "$allow_headers" != "*" ] && [[ "$allow_headers" != *content-type* ]]; then
+            echo "Chatbot API must allow content-type in Access-Control-Allow-Headers."
+            cat "$headers_file"
+            exit 1
+          fi
+
       - name: Build site
+        env:
+          CHATBOT_API_KEY: ${{ secrets.CHATBOT_API_KEY }}
+          CHATBOT_API_BASE: ${{ vars.CHATBOT_API_BASE || secrets.CHATBOT_API_BASE }}
+          CHATBOT_MODEL: ${{ vars.CHATBOT_MODEL || secrets.CHATBOT_MODEL }}
         run: npx quartz build
 
       - name: Setup Pages

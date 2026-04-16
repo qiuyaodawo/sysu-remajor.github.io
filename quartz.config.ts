@@ -16,7 +16,7 @@ const config: QuartzConfig = {
       provider: "plausible",
     },
     locale: "en-US",
-    baseUrl: "quartz.jzhao.xyz",
+    baseUrl: "sysu-remajor.github.io",
     ignorePatterns: ["private", "template", ".obsidian"],
     defaultDateType: "modified",
     theme: {

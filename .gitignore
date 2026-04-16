@@ -1,5 +1,6 @@
 .DS_Store
 .gitignore
+.env
 node_modules
 public
 prof
@@ -18,4 +19,6 @@ content/.obsidian/*
 
 # playwright-cli
 *.log
+.playwright-cli/
 content/.playwright-cli/
+.tmp-chatbot-stub.cjs

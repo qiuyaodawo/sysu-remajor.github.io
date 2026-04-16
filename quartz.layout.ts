@@ -6,6 +6,10 @@ export const sharedPageComponents: SharedLayout = {
   head: Component.Head(),
   header: [],
   afterBody: [
+    Component.ConditionalRender({
+      component: Component.Chatbot(),
+      condition: (page) => page.fileData.slug === "chatbot",
+    }),
     Component.Comments({
       provider: "giscus",
       options: {
